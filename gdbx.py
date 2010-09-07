@@ -22,168 +22,109 @@
 import sys
 import locale
 import gdb
-import os
 import subprocess
-import atexit
-import base64
-import time
+import tempfile
+import re
 
 HEXDUMP_PATH="/usr/bin/hexdump"
 ICONV_PATH="/usr/bin/iconv"
+XMLLINT_PATH="/usr/bin/xmllint"
 
-DEBUG=True
+DEBUG=False
 
+DEBUG_FD=sys.stderr
 def error(message):
     sys.stderr.write("error: %s\n" % message)
 
 def debug(message):
     if DEBUG:
-        sys.stderr.write("debug: %s\n" % message)
+        DEBUG_FD.write("debug: %s\n" % message)
+        DEBUG_FD.flush()
 
-
-class TmpFile(object):
-    """A temporary file wrapper
-
-This is a simple wrapper class for similar to os.tmpnam() with
-automatic file creation.   Since os.tmpnam() has a security hole, but
-GDB dump command creates its own file, so we cannot use Python tempfile
-module.
-
-   tmp = TmpFile()
-   ...
-   fd = open(tmp.name(), "w");
-   ...
-   
-A temporary file createed once TmpFile object is created, then removed
-automatically when the object is out of reference.   To handle the exception,
-all temporary file names are recorded, then TmpFile.unlinkall() is registered
-via atexit.register()."""
-    TEMPLATE="/tmp/gdb-%s"
-    filelist = dict()
+def set_debug_file(pathname):
+    global DEBUG_FD
+    DEBUG_FD = open(pathname, "w")
     
-    @staticmethod
-    def AddFile(filename):
-        """Add given filename into the local dictionary"""
-        TmpFile.filelist[filename] = True
+def cmd_dump(filename, args, format="binary", type="value"):
+    cmd = "dump %s %s %s %s" % (format, type, filename, args)
+    debug("cmd_dump: executing '%s'..." % cmd )
+    try:
+        gdb.execute(cmd)
+    except RuntimeError as e:
+        error("%s" % e)
+        #raise
 
-    @staticmethod
-    def unlink(filename):
-        """Unlink(remove) given filename, ignore any exception"""
+def set_default_encoding(encoding = None):
+    """set_default_encoding(encoding) - set the default character encoding
+
+Set the default character encoding of the run-time.  If 'encoding' is not
+provided, the current locale's character encoding is used by default.
+
+If current locale's encoding is not set,  and 'encoding' is not provided,
+the system encoding will not be changed.
+
+On invalid encoding name, it returns False.  Otherwise returns True."""
+
+    defenc = sys.getdefaultencoding().upper()
+    debug("system default encoding: %s" % defenc)
+    if encoding == None:
+        encoding = locale.getlocale()[1]
+        debug("locale encoding (LC_CTYPE): %s" % encoding)
+        if encoding:
+            encoding = encoding.upper()
+        
+    if encoding != None and defenc != encoding and \
+       defenc.find(encoding) < 0 and encoding.find(defenc) < 0:
+        # If the new encoding 'encoding' is different from the default
+        # encoding 'defenc',
+        reload(sys)
         try:
-            os.unlink(filename)
-            del TmpFile.filelist[filename]
-        except:
-            pass
+            sys.setdefaultencoding(encoding)
+            debug("Default encoding is changed to: %s" % encoding)
+        except LookupError as e:
+            error("unrecoginized encoding, '%s'" % encoding)
+            return False
+    else:
+        debug("Default encoding is %s" % defenc)
 
-    @staticmethod
-    def unlinkall():
-        """Unlink(remove) all files created via TmpFile.
-
-This method is good for atexit.register()."""
-        #print "TmpFile.unlinkall()!"
-        for f in TmpFile.filelist:
-            TmpFile.unlink(f)
-            
-    def __init__(self, create=True):
-        self.filename = None
-        if create:
-            self.create()
-
-    def __del__(self):
-        self.delete()
-        
-    def create(self):
-        if self.filename != None:
-            self.delete()
-            
-        tries = 0
-        while True:
-            sid = base64.b64encode("%s" % time.time()).replace("=", "_")
-            filename = TmpFile.TEMPLATE % sid
-            if not os.access(filename, os.F_OK):
-                fd = open(filename, "w")
-                fd.close()
-                self.filename = filename
-                break
-            tries += 1
-        #print "TmpFile.create(%s)" % self.filename
-
-    def delete(self):
-        #print "TmpFile.delete(%s)" % self.filename
-        TmpFile.unlink(self.filename)
-        self.filename = None
-
-    def name(self):
-        return self.filename
     
-atexit.register(TmpFile.unlinkall)
-
-
-class GdbDumpRunner(gdb.Command):
-    """Wrapper for gdb.Command to make easy to make a new GDB command.
-
-The __init__() accepts the same arguments as that of gdb.Command.
-
-This class is for the GDB command that accept a symbol or memory
-location for the data, then executes shell command to display the
-data.
-
-You need to inherit new class from this class, then override its
-method.  For a simple shell command, overriding commandline() and
-usage() methods are enough.  See the source code of HexDumpCommand,
-HexDumpValueCommand, and HexdumpMemoryCommand for more.
-
-If you need sofiscated handling of shell command, you may need to
-override its parse_arguments() and execute() method.  See the source
-code of IconvCommand, IconvValueCommand, and IconvMemoryCommand.
-
-Internally, when a user defined command is executed, GdbDumpRunner's
-invoke() is called.  Then, invoke() calls its parse_arguments() method
-to parse the argument that passed to the GDB command.  The default
-behavior of invoke() is to create a temporary file that has the data,
-then call its execute() method.  The execute() method then calls its
-commandline() method to get the shell command line argument, executes
-the shell command, then print its output."""
-
-    def __init__(self, name, cmdclass, completer = -1, prefix = False):
-        gdb.Command.__init__(self, name, cmdclass, completer, prefix)
-        self.completer = completer
-        
-    def commandline(self, filename, exec_args):
-        """Returns the shell command line, in the form of a list of arguments.
-
-By default, it returns an empty list.  You may need to override this
-method.""" 
-        return []
-
-    def usage(self):
-        """Prints the usage information in case of wrong/invalid arguments.
-
-By default, it returns an empty string.  You may need to override this
-method."""
-        return ""
+class GdbDumpParent(gdb.Command):
+    def __init__(self, name, completer = -1, prefix = False):
+        gdb.Command.__init__(self, name, gdb.COMMAND_DATA, completer, prefix)
 
     def parse_arguments(self, args):
-        """separate GDB dump arguments from arguments for execute() method.
+        """parse the command arguments into two group; gdb dump
+arguments and execute arguments.
 
-Note that the return value should be (dump_arguments, exec_arguments).
-Both members should be in string type.  By default, the argument to
-this method should go to dump_arguments, and exec_arguments will be an
-empty string."""
+GDB dump arguments is a string containing all arguments that will be
+passed to the GDB 'dump' command.
+
+Execute arguments is a string containing command line arguments that
+will be used for the executing the shell command.  The exact command
+line arguments are built via self.commandline()."""
         return (args, "")
+
+    def commandline(self, filename, args):
+        """commandline(filename, args) -- build the shell command line.
+
+'filename' is the pathname of the file that contains the data, 'args'
+is a string contains the arguments that is passed from user input.
+
+The return value should be in either a string value or a list contains
+one or more string values."""
+
+        return []
     
-    def execute(self, filename, exec_args):
-        """execute(filename, exec_args) -- Execute a shell command.
-
-'filename' holds the filename that has the data GDB provides,
-'exec_args' holds the command line arguments for the shell command in
-string.
-
-You may need to override this method if you want sofiscated shell
-executing."""
-        cmdline = self.commandline(filename, exec_args)
-        debug("cmd: %s" % repr(cmdline))
+    def execute(self, filename, args):
+        cmdline = self.commandline(filename, args)
+        if type(cmdline) != list:
+            use_shell = True
+        else:
+            use_shell = False
+        debug("type of cmdline: %s" % type(cmdline))
+        debug("excuting %s (shell=%s)" % (cmdline, use_shell))
         p = subprocess.Popen(cmdline,
+                             shell=use_shell,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         (out, err) = p.communicate()
         status = p.wait()
@@ -193,136 +134,274 @@ executing."""
             sys.stdout.write(err)
         debug("exit status: %d" % status)
         return True
+
+    def dump(self, filename, args):
+        debug("Never reached here!!!")
+        pass
+
+    def on_execute_error(self):
+        pass
     
-    def gdb_dump(self, filename, args):
-        """gdb_dump(filename, args) -- Wrapper for the GDB dump command
-
-'filename' is the output filename for the GDB dump command, 'args' is
-a string that is passed to the GDB dump command."""
-        
-        if self.completer == gdb.COMPLETE_SYMBOL:
-            cmd = "dump binary value %s %s" % (filename, args)
-        elif self.completer == gdb.COMPLETE_LOCATION:
-            cmd = "dump binary memory %s %s" % (filename, args)
-        else:
-            raise RuntimeError("completer class is not SYMBOL nor LOCATION")
-        debug("executing GDB %s" % cmd)
-        gdb.execute(cmd)
-            
     def invoke(self, args, from_tty):
-        """A callback for gdb.Command"""
-        tmp = TmpFile()
-        try:
-            (dump_args, exec_args) = self.parse_arguments(args)
-            self.gdb_dump(tmp.name(), dump_args)
-            if not self.execute(tmp.name(), exec_args):
-                print self.usage()
-        except RuntimeError as e:
-            print e
-        except:
-            sys.stderr.write("error: an exception occurred during excution")
-            raise
-            print self.usage()
-        finally:
-            sys.stdout.flush()
-            del tmp
-
-
-class HexdumpCommand(GdbDumpRunner):
-    def __init__(self):
-        GdbDumpRunner.__init__(self, "hexdump", gdb.COMMAND_DATA,
-                               gdb.COMPLETE_NONE, True)
-
-class HexdumpValueCommand(GdbDumpRunner):
-    def __init__(self):
-        GdbDumpRunner.__init__(self, "hexdump value", gdb.COMMAND_DATA,
-                               gdb.COMPLETE_SYMBOL)
-
-    def commandline(self, filename, exec_args):
-        return [HEXDUMP_PATH, "-C", filename]
-
-    def usage(self):
-        return "usage: hexdump value EXPR"
-
-class HexdumpMemoryCommand(GdbDumpRunner):
-    def __init__(self):
-        GdbDumpRunner.__init__(self, "hexdump memory", gdb.COMMAND_DATA,
-                               gdb.COMPLETE_SYMBOL)
-
-    def commandline(self, filename, exec_args):
-        return [HEXDUMP_PATH, "-C", filename]
-
-    def usage(self):
-        return "usage: hexdump memory START_ADDR END_ADDR"
-
-
-class IconvCommand(GdbDumpRunner):
-    def __init__(self):
-        GdbDumpRunner.__init__(self, "iconv", gdb.COMMAND_DATA, 0, True)
-
-    @staticmethod
-    def set_encoding(encoding = None):
-        defenc = sys.getdefaultencoding().upper()
-        if encoding == None:
-            encoding = locale.getlocale()[1]
-            
-        if defenc != encoding and \
-           defenc.find(encoding.upper()) < 0 and \
-           encoding.upper().find(defenc) < 0:
-            reload(sys)
-            sys.setdefaultencoding(encoding)
-            debug("Default encoding is changed to: %s" % encoding)
-        else:
-            debug("Default encoding is %s" % defenc)
-
-
-class IconvEncodingCommand(gdb.Command):
-    def __init__(self):
-        # iconv value VALUE TO-ENCODING FROM-ENCODING...
-        gdb.Command.__init__(self, "iconv encoding", gdb.COMMAND_STATUS,
-                             gdb.COMPLETE_NONE, "iconv")
-
-    def invoke(self, args, from_tty):
-        argv = args.split()
-        print "argv: ", argv
-        if len(argv) == 0:
-            print sys.getdefaultencoding()
-        elif len(argv) == 1:
+        with tempfile.NamedTemporaryFile(prefix="gdb-") as tmp:
+        #tmp = tempfile.NamedTemporaryFile(prefix="gdb-")
+        #if True:
             try:
-                IconvCommand.set_encoding(argv[0])
-            except LookupError:
-                sys.stderr.write("Unknown encoding: %s" % argv[0])
+                (dump_args, exec_args) = self.parse_arguments(args)
+                debug("dump_args: |%s|" % dump_args)
+                debug("exec_args: |%s|" % exec_args)
+                self.dump(tmp.name, dump_args)
+                if not self.execute(tmp.name, exec_args):
+                    self.on_execute_error()
+            except RuntimeError as e:
+                print e
+            except:
+                sys.stderr.write("error: an exception occurred during excution")
+                raise
+            
+class GdbDumpValueParent(GdbDumpParent):
+    def __init__(self, name, completer = -1, prefix = False):
+        GdbDumpParent.__init__(self, name, completer, prefix)
+
+    def dump(self, filename, args):
+        cmd_dump(filename, args, format="binary", type="value")
+        
+class GdbDumpMemoryParent(GdbDumpParent):
+    def __init__(self, name, completer = -1, prefix = False):
+        GdbDumpParent.__init__(self, name, completer, prefix)
+
+    def dump(self, filename, args):
+        cmd_dump(filename, args, format="binary", type="memory")
 
 
-class IconvDumpRunner(GdbDumpRunner):
-    def __init__(self, name, cmdclass,
-                 completer = gdb.COMPLETE_NONE, prefix = False):
-        GdbDumpRunner.__init__(self, name, cmdclass, completer, prefix)
-    def format_error(self, msg):
-        """Beautify the error message from the iconv(1)"""
-        # Mostly, the error message from the iconv(1) will look like:
-        #   /usr/bin/iconv: illegal input sequence at position 4
+class HexdumpCommand(gdb.Command):
+    """Dump the given data using hexdump(1)"""
+    def __init__(self):
+        gdb.Command.__init__(self, "hexdump", gdb.COMMAND_DATA, -1, True)
 
-        # I don't want to be verbose.  Thus, accepting only the first line.
-        pos = msg.find("\n")
-        if pos > 0:
-            msg = msg[:pos]
-            
-        pos = msg.find(":")
-        if pos < 0:
-            return msg
+class HexdumpImpl(object):
+    def parse_argument(self, args):
+        idx = args.find("##")
+        if idx < 0:
+            debug("hexdump impl parse args: |%s|, |%s|" % (args, ""))
+            return (args, "")
         else:
-            return msg[pos + 1:]
+            debug("hexdump impl parse args: |%s|, |%s|" % (args[:idx].strip(), args[idx+2:].strip()))
+            return (args[:idx].strip(), args[idx+2:].strip())
+
+    def commandline(self, filename, args):
+        if args == "":
+            return [HEXDUMP_PATH, "-C", filename]
+        else:
+            return "%s %s %s" % (HEXDUMP_PATH, args, filename)
+
+    def complete(self, text, word):
+        if text.find("##") < 0:
+            return gdb.COMPLETE_SYMBOL
+        else:
+            return gdb.COMPELTE_NONE
         
-    def execute(self, filename, exec_args):
-        args = exec_args.split()
-        to_enc = sys.getdefaultencoding()
-        from_encs = args
+class HexdumpValueCommand(GdbDumpValueParent):
+    """Dump the value EXPR using hexdump(1)
+
+usage: hexdump value EXPR [## OPTION...]
+
+Dump the value, EXPR using hexdump(1).  If no OPTION is provided, '-C'
+is assumed (canonnical hex+ASCII display).  If provided, OPTION is
+passed to hexdump(1).  Note that you need '##' to separate EXPR from
+OPTION.
+
+For example, to dump the value, 'buffer' using hexdump(1) '-C':
+
+    (gdb) hexdump value buffer
+
+To dump the value, 'buffer' in one-byte octal display:
+
+    (gdb) hexdump value buffer ## -b
+"""
+    def __init__(self):
+        GdbDumpValueParent.__init__(self, "hexdump value", -1)
+        self.impl = HexdumpImpl()
         
-        width = max(map(len, from_encs))
-        for enc in from_encs:
-            p = subprocess.Popen([ICONV_PATH,
-                                  "-t", to_enc, "-f", enc, filename],
+    def parse_arguments(self, args):
+        return self.impl.parse_argument(args)
+    
+    def commandline(self, filename, args):
+        return self.impl.commandline(filename, args)
+
+    def complete(self, text, word):
+        return self.impl.complete(text, word)
+        
+class HexdumpMemoryCommand(GdbDumpMemoryParent):
+    """Dump the memory using hexdump(1)
+
+usage: hexdump memory START_ADDR END_ADDR [## OPTION...]
+
+Dump the memory from START_ADDR to END_ADDR using hexdump(1).  If no
+OPTION is provided, '-C' is assumed (canonnical hex+ASCII display).
+If provided, OPTION is passed to hexdump(1).  Note that you need '##'
+to separate EXPR from OPTION.
+
+For example, to dump the memory from 'buffer' (100 bytes) using
+hexdump(1) '-C':
+
+    (gdb) hexdump memory buffer ((char*)buffer+100)
+
+To dump the value, 'buffer' in one-byte octal display:
+
+    (gdb) hexdump memory buffer ((char*)buffer+100) ## -b
+"""
+    def __init__(self):
+        GdbDumpMemoryParent.__init__(self, "hexdump memory", -1)
+        self.impl = HexdumpImpl()
+        
+    def parse_arguments(self, args):
+        return self.impl.parse_argument(args)
+    
+    def commandline(self, filename, args):
+        return self.impl.commandline(filename, args)
+
+    def complete(self, text, word):
+        return self.impl.complete(text, word)
+        
+HexdumpCommand()
+HexdumpValueCommand()
+HexdumpMemoryCommand()
+
+
+class IconvCommand(gdb.Command):
+    """Check the character encoding of the data"""
+    def __init__(self):
+        gdb.Command.__init__(self, "iconv", gdb.COMMAND_DATA, -1, True)
+
+class IconvEncodings(object):
+    encodings = None
+    replaces = "./:-()"
+    
+    @staticmethod
+    def supported_encodings():
+        ret = dict()
+        try:
+            p = subprocess.Popen([ICONV_PATH, "-l"], stdout=subprocess.PIPE)
+            outbuf = p.communicate()[0]
+            enclist = outbuf.split("\n")
+            for enc in enclist:
+                # 'enc' is something like "ANSI_X3.110-1983//"
+                enc = enc.rstrip("/")
+                alias = enc.lower()
+
+                for repl in IconvEncodings.replaces:
+                    alias = alias.replace(repl, "_")
+                
+                ret[alias] = enc
+        except:
+            print "error: cannot get supported encoding list"
+            raise
+        
+        return ret
+
+    def __init__(self):
+        if IconvEncodings.encodings == None:
+            IconvEncodings.encodings = IconvEncodings.supported_encodings()
+            reload(sys)
+            
+    def name(self, alias):
+        """Return the actual encoding name if exists, otherwise None"""
+        alias = alias.lstrip("#")
+        if IconvEncodings.encodings.has_key(alias):
+            return IconvEncodings.encodings[alias]
+        return None
+
+    def complete(self, text, word):
+        """Callback for auto completion, used in gdb.Command.complete()"""
+        ret = list()
+
+        debug("Encodings.complete(): text(%s) word(%s)" % (text, word))
+        for a in IconvEncodings.encodings.iterkeys():
+            #debug("    enc(%s)" % a)
+            if a.find(word) == 0:
+                ret.append(a)
+        return ret
+        
+class IconvEncodingCommand(gdb.Command):
+    """Set/get the current character encoding
+
+usage: iconv encoding [ENCODING]
+
+If ENCODING is not provided, this command shows the current system encoding.
+If provided, this command set the current system encoding to ENCODING.
+
+Once set, 'iconv value' and 'iconv memory' will try to convert the
+given data into ENCODING.
+
+Note that this changes the internal 'system default encoding' in
+Python runtime."""
+    
+    def __init__(self):
+        gdb.Command.__init__(self, "iconv encoding", gdb.COMMAND_DATA, -1)
+        self.encodings = IconvEncodings()
+        
+    def invoke(self, arg, from_tty):
+        arg = arg.strip()
+        debug("arg: '%s'" % arg)
+        if arg == "":
+            print sys.getdefaultencoding()
+        else:
+            enc = self.encodings.name(arg)
+            if enc != None:
+                try:
+                    sys.setdefaultencoding(enc)
+                except LookupError as e:
+                    error("encoding %s is not supported by Python" % enc)
+            else:
+                error("invalid encoding alias, %s." % arg)
+    def complete(self, text, word):
+        debug("iconv encoding complete: text(%s) word(%s)" % (text, word))
+        return self.encodings.complete(text, word)
+        
+class IconvImpl(object):
+    def __init__(self):
+        self.re_encoding = re.compile(r"([ ]*(#[a-z0-9_]+))+")
+        self.encodings = IconvEncodings()
+        
+    def partition(self, args):
+        m = self.re_encoding.search(args)
+        if m == None:
+            return (args, "")
+        else:
+            idx = m.start()
+            return (args[:idx], args[idx:])
+            
+    def format_error(self, errbuf):
+        """Format iconv(1)-related error message
+
+Currently, capture the only first line, removing iconv pathname"""
+        (msg, dummy1, dummy2) = errbuf.partition("\n")
+        idx = msg.find("iconv: ")
+        if idx >= 0:
+            return msg[idx:]
+        
+    def execute_iconv(self, filename, args):
+        debug("execute_iconv('%s', '%s')" % (filename, args))
+        encodings = list()
+        for e in args.split():
+            realname = self.encodings.name(e)
+            if realname != None:
+                debug("  target encoding: %s" % self.encodings.name(e))
+                encodings.append(realname)
+            else:
+                error("unknown encoding alias %s, ignored" % e)
+                
+        target = sys.getdefaultencoding()
+
+        width = max(map(len, encodings))
+
+        sys.stdout.write("Target encoding is %s:\n" % target)
+        
+        for enc in encodings:
+            cmdline = [ICONV_PATH, "-t", target, "-f", enc, filename]
+            debug("cmdline: %s" % cmdline)
+            p = subprocess.Popen(cmdline,
                                  stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE)
             (out, err) = p.communicate()
@@ -330,67 +409,231 @@ class IconvDumpRunner(GdbDumpRunner):
 
             try:
                 sys.stdout.write("%*s: " % (width, enc))
-                #print "out: ", out
                 sys.stdout.write("|%s|\n" % out)
             except TypeError as e:
                 sys.stdout.write("\n")
-                error("TypeError: %s" % e.args)
-                error("Try to change the default encoding via 'iconv encoding'")
-
+                error("TypeError: %s" % e)
+                error("Try to change the default encoding")
             if err != "":
                 sys.stdout.write("\t%s\n" % self.format_error(err))
         return True
-
-
-class IconvValueCommand(IconvDumpRunner):
-    def __init__(self):
-        # iconv value VALUE ENCODING...
-        IconvDumpRunner.__init__(self, "iconv value", gdb.COMMAND_DATA,
-                                 gdb.COMPLETE_SYMBOL, "iconv")
-    def parse_arguments(self, args):
-        # The first one is the symbol that needs to be passed GDB dump,
-        # and the rest should be passed to execute() method
-        (dump_args, dummy, exec_args) =  args.partition(' ')
-        return (dump_args.strip(), exec_args.strip())
-
-class IconvMemoryCommand(IconvDumpRunner):
-    def __init__(self):
-        # iconv value VALUE ENCODING...
-        IconvDumpRunner.__init__(self, "iconv memory", gdb.COMMAND_DATA,
-                                 gdb.COMPLETE_LOCATION, "iconv")
-    def parse_arguments(self, args):
-        # The first one is the symbol that needs to be passed GDB dump,
-        # and the rest should be passed to execute() method
-        args = args.strip()
-        (args1, dummy, args2) =  args.partition(' ')
-        mem_start = args1.strip()
-        (args1, dummy, args2) =  args2.strip().partition(' ')
-        mem_end = args1.strip()
-
-        return ("%s %s" % (mem_start, mem_end), args2.strip())
-
-
-class XmllintCommand(GdbDumpRunner):
-    def __init__(self):
-        GdbDumpRunner.__init__(self, "xmllint", gdb.COMMAND_DATA, 0, True)
         
-class XmllintValueCommand(GdbDumpRunner):
+    def complete_any(self, text, word):
+        try:
+            prevchar = text[-(len(word) + 1)]
+        except:
+            prevchar = ""
+        debug("complete: text(%s), word(%s), prev(%s)" % \
+              (text, word, prevchar))
+        if prevchar == "#":
+            debug("complete for encoding...")
+            return self.encodings.complete(text, word)
+        else:
+            debug("complete for symbol...")
+            return gdb.COMPLETE_SYMBOL
+        
+class IconvValueCommand(GdbDumpValueParent, IconvImpl):
+    """Check the encoding of the value EXPR.
+
+usage: iconv memory EXPR ENCODING [ENCODING]...
+
+Send a value EXPR to iconv(1) command to check the encoding of the
+contents.  ENCODING is the source encoding of the memory region.  The
+target encoding is controlled via 'iconv encoding' command.
+
+If more than one ENCODING provided, iconv(1) is called several times
+for each ENCODING.
+
+ENCODING is an alias name that has a form '#name', where 'name' is
+a encoding name except these:
+
+  1. all capital letters are in lower-cases
+  2. all non-alpha-numeric characters are substituted to the
+     underline character('_').
+
+For example, to use the character encoding 'ISO_8859-10:1992', the
+ENCODING should be 'iso_8859_10_1992'.  Note that this command will
+support auto-completion for the ENCODING.
+
+For example, if you know want to make sure that the value 'buffer'
+contains Korean character, but you don't know the exact encoding, you
+may try following:
+
+    (gdb) iconv memory buffer buffer+100 #euc_kr #cp949 #utf-8
+
+Then it will try three times for the encoding 'EUC-KR', 'CP949', and
+'UTF-8'."""
+    # iconv value EXPR #ENCODING...
+    
     def __init__(self):
-        GdbDumpRunner.__init__(self, "xmllint value", gdb.COMMAND_DATA,
-                               gdb.COMPLETE_SYMBOL, "xmllint")
+        GdbDumpValueParent.__init__(self, "iconv value", -1)
+        IconvImpl.__init__(self)
 
-    def commandline(self, filename, exec_args):
-        return [HEXDUMP_PATH, "-C", filename]
+    def complete(self, text, word):
+        return self.complete_any(text, word)
 
-    def usage(self):
-        return "usage: hexdump value EXPR"
+    def execute(self, filename, args):
+        return self.execute_iconv(filename, args)
+    
+    def parse_arguments(self, args):
+        return self.partition(args)
+        
+class IconvMemoryCommand(GdbDumpMemoryParent, IconvImpl):
+    """Check the encoding of the memory.
 
-hd = HexdumpCommand()
-HexdumpValueCommand()
-HexdumpMemoryCommand()
+usage: iconv memory START_ADDR END_ADDR ENCODING [ENCODING]...
 
-IconvCommand.set_encoding()
+Send a memory region to iconv(1) command to check the encoding of the
+contents.  ENCODING is the source encoding of the memory region.  The
+target encoding is controlled via 'iconv encoding' command.
+
+If more than one ENCODING provided, iconv(1) is called several times
+for each ENCODING.
+
+ENCODING is an alias name that has a form '#name', where 'name' is
+a encoding name except these:
+
+  1. all capital letters are in lower-cases
+  2. all non-alpha-numeric characters are substituted to the
+     underline character('_').
+
+For example, to use the character encoding 'ISO_8859-10:1992', the
+ENCODING should be 'iso_8859_10_1992'.  Note that this command will
+support auto-completion for the ENCODING.
+
+For example, if you know want to make sure that the memory from
+'buffer' to 'buffer+100' contains Korean character, but you don't know
+the exact encoding, you may try following:
+
+    (gdb) iconv memory buffer buffer+100 #euc_kr #cp949 #utf-8
+
+Then it will try three times for the encoding 'EUC-KR', 'CP949', and
+'UTF-8'."""
+    # iconv value EXPR #ENCODING...
+    
+    def __init__(self):
+        GdbDumpMemoryParent.__init__(self, "iconv memory", -1)
+        IconvImpl.__init__(self)
+
+    def complete(self, text, word):
+        return self.complete_any(text, word)
+
+    def execute(self, filename, args):
+        return self.execute_iconv(filename, args)
+    
+    def parse_arguments(self, args):
+        r = self.partition(args)
+        debug("parse_argument: partition: %s" % repr(r))
+        return r
+
+class XmllintCommand(gdb.Command):
+    """Check the XML using xmllint(1)"""
+    def __init__(self):
+        gdb.Command.__init__(self, "xmllint", gdb.COMMAND_DATA, -1, True)
+
+class XmllintImpl(object):
+    def complete(self, text, word):
+        if text.find("##") < 0:
+            return gdb.COMPLETE_SYMBOL
+        else:
+            return gdb.COMPLETE_NONE
+        
+    def partition(self, args):
+        idx = args.rfind("##")
+        if idx < 0:
+            return (args, "")
+        else:
+            return (args[:idx].strip(), args[idx+2:].strip())
+
+    def commandline(self, filename, args):
+        # args is something like '--format --schema http://asdfadf --debug'
+        return "%s %s %s" % (XMLLINT_PATH, args, filename)
+        
+class XmllintValueCommand(GdbDumpValueParent):
+    """Check the value of an expression as a full XML document
+
+Usage: xmllint value EXPR [## ARGUMENTS...]
+
+Send the value of EXPR to xmllint(1) to check the validity.
+
+ARGUMENTS is the additional arguments that will be passed to
+xmllint(1).  If you use ARGUMENTS, make sure to separate them from
+EXPR using '##'.
+
+To validate 'xml_buffer', just use:
+
+    (gdb) xmllint value xml_buffer
+    
+To validate 'xml_buffer' and to indent for human-readability:
+    
+    (gdb) xmllint value xml_buffer ## --format
+"""
+    def __init__(self):
+        # xmllint value EXPR ## OPTIONS...
+        
+        GdbDumpValueParent.__init__(self, "xmllint value", -1)
+        self.impl = XmllintImpl()
+        
+    def complete(self, text, word):
+        debug("xmllint value complete: text(%s) word(%s)" % (text, word))
+        return self.impl.complete(text, word)
+
+    def parse_arguments(self, args):
+        return self.impl.partition(args)
+
+    def commandline(self, filename, args):
+        return self.impl.commandline(filename, args)
+    
+class XmllintMemoryCommand(GdbDumpMemoryParent):
+    """Check the contents of memory as a full XML document
+
+Usage: xmllint memory START_ADDR END_ADDR [## ARGUMENTS...]
+
+Send the memory from the address START_ADDR to the address END_ADDR to
+xmllint(1) to check the validity.
+
+ARGUMENTS is the additional arguments that will be passed to
+xmllint(1).  If you use ARGUMENTS, make sure to separate them from
+EXPR using '##'.
+
+To validate a memory from 'xml_buffer' to plus 100 units:
+
+    (gdb) xmllint memory xml_buffer xml_buffer+100
+
+If 'xml_buffer' is not an array of character, you may need to cast it:
+
+    (gdb) xmllint memory xml_buffer ((char*)xml_buffer)+100
+
+To validate and to indent for human-readability:
+    
+    (gdb) xmllint value xml_buffer xml_buffer+100 ## --format
+"""
+    def __init__(self):
+        # xmllint value EXPR ## OPTIONS...
+        
+        GdbDumpMemoryParent.__init__(self, "xmllint memory", -1)
+        self.impl = XmllintImpl()
+        
+    def complete(self, text, word):
+        debug("xmllint memory complete: text(%s) word(%s)" % (text, word))
+        return self.impl.complete(text, word)
+
+    def parse_arguments(self, args):
+        return self.impl.partition(args)
+
+    def commandline(self, filename, args):
+        return self.impl.commandline(filename, args)
+    
+
+set_default_encoding()
+
 IconvCommand()
+IconvEncodingCommand()
 IconvValueCommand()
 IconvMemoryCommand()
-IconvEncodingCommand()
+
+XmllintCommand()
+XmllintValueCommand()
+XmllintMemoryCommand()
+
+#set_debug_file("/dev/pts/13")
