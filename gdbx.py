@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-# $Id$
-
 # Some useful GDB command in python
 # Copyright (C) 2010   Seong-Kook Shin <cinsky@gmail.com>
 #
